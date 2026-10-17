@@ -232,7 +232,8 @@ struct Home: View {
     private var emptyState: some View {
         VStack(spacing: 14) {
             if store.isLoading {
-                ProgressView().tint(.white)
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
                 Text("正在连接 \(FeedConfig.base)")
                     .foregroundColor(.white.opacity(0.6)).font(.footnote)
             } else {
@@ -313,6 +314,7 @@ struct Home: View {
 // MARK: - 服务器设置
 
 struct ServerSettingsView: View {
+    var onSaved: () -> Void = {}
     @State private var text: String = FeedConfig.base
     @State private var status = ""
     @Environment(\.presentationMode) var presentation
@@ -363,6 +365,7 @@ struct ServerSettingsView: View {
 
     private func save() {
         FeedConfig.base = normalized()
+        onSaved()
         presentation.wrappedValue.dismiss()
     }
 }
