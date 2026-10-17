@@ -377,6 +377,11 @@ struct ContentView: View {
     var body: some View { Home() }
 }
 
+/// SceneDelegate 用它当根控制器（状态栏浅色）
+class Host: UIHostingController<ContentView> {
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
+}
+
 struct Home: View {
     @StateObject private var store = FeedStore()
     @StateObject private var scroller = ScrollController()
