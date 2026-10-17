@@ -21,11 +21,10 @@ enum AppConfig {
     }
 }
 
-/// 播放到头之后干什么
 enum EndBehavior: Int {
-    case loop = 0        // 循环本条
-    case autoNext = 1    // 自动连播下一条
-    case stop = 2        // 停在最后一帧
+    case loop = 0
+    case autoNext = 1
+    case stop = 2
 
     var title: String {
         switch self {
@@ -55,12 +54,8 @@ struct FeedItem: Identifiable, Equatable {
     let authorId: String
     let caption: String
     let likeCount: Int
-    let width: Int
-    let height: Int
 
     static func == (lhs: FeedItem, rhs: FeedItem) -> Bool { lhs.id == rhs.id }
-
-    var posterBest: URL { firstFrameURL }
 }
 
 struct AuthorInfo {
@@ -70,7 +65,7 @@ struct AuthorInfo {
     let likes: Int
 }
 
-// MARK: - 图片缓存（首帧 / 封面）
+// MARK: - 图片
 
 final class ImageLoader {
     static let shared = ImageLoader()
@@ -82,10 +77,8 @@ final class ImageLoader {
         cfg.timeoutIntervalForRequest = 10
         cfg.requestCachePolicy = .returnCacheDataElseLoad
         session = URLSession(configuration: cfg)
-        cache.countLimit = 80
+        cache.countLimit = 120
     }
-
-    func cached(_ url: URL) -> UIImage? { cache.object(forKey: url as NSURL) }
 
     func load(_ url: URL, completion: @escaping (UIImage?) -> Void) {
         if let img = cache.object(forKey: url as NSURL) {
@@ -105,7 +98,6 @@ final class ImageLoader {
         }.resume()
     }
 
-    /// 先试 firstframe，失败退 poster
     func loadPoster(for item: FeedItem, completion: @escaping (UIImage?) -> Void) {
         load(item.firstFrameURL) { [weak self] img in
             if let img = img { completion(img); return }
@@ -119,90 +111,24 @@ struct RemoteImage: View {
     @State private var image: UIImage?
 
     var body: some View {
-        ZStack {
-            Color.black
-            if let image = image {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .clipped()
+        GeometryReader { geo in
+            ZStack {
+                Color.black
+                if let image = image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                }
             }
         }
         .onAppear {
-            if image != nil { return }
+            guard image == nil else { return }
             ImageLoader.shared.loadPoster(for: item) { img in
                 if let img = img { self.image = img }
             }
         }
-    }
-}
-
-// MARK: - 播放器池
-
-final class PlayerPool {
-    static let shared = PlayerPool()
-
-    private var players: [Int: AVPlayer] = [:]
-    private var order: [Int] = []
-    private let limit = 4
-
-    func player(for item: FeedItem) -> AVPlayer {
-        if let p = players[item.id] {
-            touch(item.id)
-            return p
-        }
-        let p = AVPlayer(url: item.streamURL)
-        p.actionAtItemEnd = .none
-        p.automaticallyWaitsToMinimizeStalling = false
-        if #available(iOS 15.0, *) {
-            p.currentItem?.preferredForwardBufferDuration = 1.0
-        }
-        players[item.id] = p
-        order.append(item.id)
-        evictIfNeeded()
-        return p
-    }
-
-    /// 提前建播放器并开始缓冲，但不播放
-    func preheat(_ items: [FeedItem]) {
-        for item in items {
-            if players[item.id] == nil {
-                _ = player(for: item)
-            }
-        }
-    }
-
-    func pauseAll(except id: Int?) {
-        for (key, p) in players where key != id {
-            p.pause()
-        }
-    }
-
-    private func touch(_ id: Int) {
-        if let idx = order.firstIndex(of: id) {
-            order.remove(at: idx)
-            order.append(id)
-        }
-    }
-
-    private func evictIfNeeded() {
-        while order.count > limit {
-            let victim = order.removeFirst()
-            players[victim]?.pause()
-            players[victim] = nil
-        }
-    }
-}
-
-// MARK: - 滚动控制（自动连播需要程序化翻页）
-
-final class ScrollController: ObservableObject {
-    weak var scrollView: UIScrollView?
-
-    func scroll(to index: Int, animated: Bool = true) {
-        guard let sv = scrollView else { return }
-        let y = CGFloat(index) * sv.bounds.height
-        sv.setContentOffset(CGPoint(x: 0, y: y), animated: animated)
     }
 }
 
@@ -220,8 +146,6 @@ struct FeedDTOItem: Decodable {
     let authorName: String?
     let authorId: String?
     let digg: Int?
-    let width: Int?
-    let height: Int?
 
     func toItem(base: String) -> FeedItem? {
         guard let stream = URL(string: "\(base)/api/stream/\(id)"),
@@ -231,12 +155,8 @@ struct FeedDTOItem: Decodable {
         let cap = (caption?.isEmpty == false ? caption! : (title ?? ""))
         return FeedItem(id: id, streamURL: stream,
                         firstFrameURL: first, posterURL: poster,
-                        authorName: author,
-                        authorId: authorId ?? "",
-                        caption: cap,
-                        likeCount: digg ?? 0,
-                        width: width ?? 1080,
-                        height: height ?? 1920)
+                        authorName: author, authorId: authorId ?? "",
+                        caption: cap, likeCount: digg ?? 0)
     }
 }
 
@@ -244,7 +164,6 @@ final class FeedStore: ObservableObject {
     @Published var items: [FeedItem] = []
     @Published var isLoading = false
     @Published var errorText: String?
-    @Published var sort: String = "newest"
 
     private var offset = 0
     private var total = Int.max
@@ -253,20 +172,18 @@ final class FeedStore: ObservableObject {
 
     var canLoadMore: Bool { offset < total }
 
-    func reset(sort: String) {
-        self.sort = sort
+    func reset() {
         items = []
         offset = 0
         total = Int.max
         busy = false
         errorText = nil
-        PlayerPool.shared.pauseAll(except: nil)
     }
 
     func loadMore() {
         guard !busy, canLoadMore else { return }
         let base = AppConfig.base
-        guard let url = URL(string: "\(base)/api/videos?limit=\(pageSize)&offset=\(offset)&sort=\(sort)") else {
+        guard let url = URL(string: "\(base)/api/videos?limit=\(pageSize)&offset=\(offset)&sort=newest") else {
             errorText = "地址无效：\(base)"
             return
         }
@@ -287,87 +204,73 @@ final class FeedStore: ObservableObject {
                     return
                 }
                 self.total = resp.total
-                let mapped = resp.items.compactMap { $0.toItem(base: base) }
                 self.offset += resp.items.count
-                self.items.append(contentsOf: mapped)
+                self.items.append(contentsOf: resp.items.compactMap { $0.toItem(base: base) })
                 self.errorText = nil
             }
         }.resume()
     }
 }
 
-final class SearchStore: ObservableObject {
-    @Published var results: [FeedItem] = []
+final class ListStore: ObservableObject {
+    @Published var items: [FeedItem] = []
     @Published var loading = false
     @Published var message: String?
 
     func search(_ text: String) {
         let q = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { results = []; message = nil; return }
+        guard !q.isEmpty else { items = []; message = nil; return }
         let base = AppConfig.base
-        guard let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "\(base)/api/videos?q=\(encoded)&limit=40&sort=newest") else { return }
+        guard let enc = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(base)/api/videos?q=\(enc)&limit=60&sort=newest") else { return }
+        fetch(url, base: base, emptyMessage: "没有匹配「\(q)」的视频")
+    }
+
+    func author(_ key: String) {
+        let base = AppConfig.base
+        guard !key.isEmpty,
+              let enc = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(base)/api/videos?author=\(enc)&limit=60&sort=newest") else {
+            message = "没有作者 ID"
+            return
+        }
+        fetch(url, base: base, emptyMessage: "这个作者没有可播放的作品")
+    }
+
+    private func fetch(_ url: URL, base: String, emptyMessage: String) {
         loading = true
         message = nil
         URLSession.shared.dataTask(with: url) { [weak self] data, _, err in
             guard let self = self else { return }
             DispatchQueue.main.async {
                 self.loading = false
-                if let err = err { self.message = "搜索失败：\(err.localizedDescription)"; return }
+                if let err = err { self.message = "请求失败：\(err.localizedDescription)"; return }
                 guard let data = data, let resp = try? JSONDecoder().decode(FeedDTO.self, from: data) else {
-                    self.message = "搜索失败"; return
+                    self.message = "数据解析失败"
+                    return
                 }
-                self.results = resp.items.compactMap { $0.toItem(base: base) }
-                if self.results.isEmpty { self.message = "没有匹配「\(q)」的视频" }
+                self.items = resp.items.compactMap { $0.toItem(base: base) }
+                if self.items.isEmpty { self.message = emptyMessage }
             }
         }.resume()
     }
 }
 
-final class AuthorStore: ObservableObject {
+final class AuthorInfoStore: ObservableObject {
     @Published var info: AuthorInfo?
-    @Published var items: [FeedItem] = []
-    @Published var loading = false
-    @Published var message: String?
 
     func load(key: String) {
-        guard !key.isEmpty else { message = "没有作者 ID"; return }
-        let base = AppConfig.base
-        loading = true
-
-        guard let enc = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else { return }
-
-        // 作者统计
-        if let url = URL(string: "\(base)/api/author?key=\(enc)") {
-            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                guard let self = self, let data = data else { return }
-                struct Resp: Decodable { let name: String?; let works: Int?; let likes: Int? }
-                if let r = try? JSONDecoder().decode(Resp.self, from: data) {
-                    DispatchQueue.main.async {
-                        self.info = AuthorInfo(key: key,
-                                               name: r.name ?? "",
-                                               works: r.works ?? 0,
-                                               likes: r.likes ?? 0)
-                    }
-                }
-            }.resume()
-        }
-
-        // 作品列表
-        if let url = URL(string: "\(base)/api/videos?author=\(enc)&limit=40&sort=newest") {
-            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                guard let self = self, let data = data,
-                      let resp = try? JSONDecoder().decode(FeedDTO.self, from: data) else { return }
-                let mapped = resp.items.compactMap { $0.toItem(base: base) }
-                DispatchQueue.main.async {
-                    self.items = mapped
-                    self.loading = false
-                    if mapped.isEmpty { self.message = "这个作者没有可播放的作品" }
-                }
-            }.resume()
-        } else {
-            loading = false
-        }
+        guard !key.isEmpty,
+              let enc = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "\(AppConfig.base)/api/author?key=\(enc)") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let data = data else { return }
+            struct Resp: Decodable { let name: String?; let works: Int?; let likes: Int? }
+            guard let r = try? JSONDecoder().decode(Resp.self, from: data) else { return }
+            DispatchQueue.main.async {
+                self?.info = AuthorInfo(key: key, name: r.name ?? "", works: r.works ?? 0, likes: r.likes ?? 0)
+            }
+        }.resume()
     }
 }
 
@@ -377,216 +280,174 @@ struct ContentView: View {
     var body: some View { Home() }
 }
 
-/// SceneDelegate 用它当根控制器（状态栏浅色）
 class Host: UIHostingController<ContentView> {
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 }
 
+// MARK: - 首页
+
 struct Home: View {
     @StateObject private var store = FeedStore()
-    @StateObject private var scroller = ScrollController()
 
     @State private var index = 0
-    @State private var tab = 0
+    @State private var playing = true
     @State private var showSettings = false
     @State private var showSearch = false
     @State private var authorRef: AuthorRef?
-    @State private var playing = true
+    @State private var pending: FeedItem?
 
     var body: some View {
         ZStack {
-            Color.black.edgesIgnoringSafeArea(.all)
+            Color.black.ignoresSafeArea()
 
             if store.items.isEmpty {
                 emptyState
             } else {
-                PlayerScrollView(items: store.items,
-                                 index: $index,
-                                 playing: playing,
-                                 onTap: { playing.toggle(); syncPlayback() },
-                                 onFinished: handleFinished)
-                    .environmentObject(scroller)
+                VerticalFeed(items: store.items,
+                             index: $index,
+                             playing: playing,
+                             onTap: { playing.toggle() },
+                             onFinished: handleFinished)
+                    .ignoresSafeArea()
             }
 
             VStack(spacing: 0) {
-                topBar
+                topControls
                 Spacer()
-                if !store.items.isEmpty { overlayBottom }
+                if !store.items.isEmpty { bottomOverlay }
             }
-            .padding(.top, UIApplication.shared.windows.first?.safeAreaInsets.top)
-            .padding(.bottom, (UIApplication.shared.windows.first?.safeAreaInsets.bottom ?? 0))
         }
-        .edgesIgnoringSafeArea(.top)
         .sheet(isPresented: $showSettings) {
             SettingsSheet {
-                store.reset(sort: store.sort)
+                store.reset()
                 index = 0
                 load()
             }
         }
-        .sheet(isPresented: $showSearch) {
-            SearchSheet { item in
-                showSearch = false
-                authorRef = nil
-                pendingPlay = item
-            }
+        .fullScreenCover(isPresented: $showSearch) {
+            SearchPage()
         }
-        .sheet(item: $authorRef) { ref in
-            AuthorSheet(key: ref.key, fallbackName: ref.name)
+        .fullScreenCover(item: $authorRef) { ref in
+            AuthorPage(key: ref.key, fallbackName: ref.name)
         }
-        .sheet(item: $pendingPlay) { item in
-            FullPlayerSheet(item: item)
+        .fullScreenCover(item: $pending) { item in
+            FullPlayerPage(item: item)
         }
         .onAppear(perform: load)
         .onChange(of: index) { newValue in
             playing = true
-            let active = store.items.indices.contains(newValue) ? store.items[newValue].id : nil
-            PlayerPool.shared.pauseAll(except: active)
-            preheat(around: newValue)
             if newValue >= store.items.count - 3 { store.loadMore() }
         }
     }
 
-    @State private var pendingPlay: FeedItem?
-
-    // MARK: 加载
-
     private func load() {
         store.loadMore()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-            preheat(around: 0)
-        }
-    }
-
-    private func preheat(around i: Int) {
-        guard !store.items.isEmpty else { return }
-        var targets: [FeedItem] = []
-        for offset in [0, 1, 2] {
-            let j = i + offset
-            if store.items.indices.contains(j) { targets.append(store.items[j]) }
-        }
-        PlayerPool.shared.preheat(targets)
-        // 顺带把下一屏的首帧图预热到内存
-        for item in targets {
-            ImageLoader.shared.loadPoster(for: item) { _ in }
-        }
-    }
-
-    private func syncPlayback() {
-        let active = store.items.indices.contains(index) ? store.items[index].id : nil
-        PlayerPool.shared.pauseAll(except: active)
-        if playing {
-            if let item = store.items[safe: index] {
-                PlayerPool.shared.player(for: item).play()
-            }
-        }
     }
 
     private func handleFinished() {
         switch AppSettings.endBehavior {
         case .loop:
-            break
-        case .autoNext:
-            if index + 1 < store.items.count {
-                scroller.scroll(to: index + 1)
-                index += 1
-            }
+            break                       // 由 VideoPage 自己 seek+play
         case .stop:
             playing = false
+        case .autoNext:
+            if index + 1 < store.items.count {
+                index += 1
+            }
         }
     }
 
     private var current: FeedItem? { store.items[safe: index] }
 
-    // MARK: 视图
+    /// 顶部：只有「推荐」两个字 + 右侧两个按钮，没有黑条
+    private var topControls: some View {
+        HStack(spacing: 16) {
+            Text("推荐")
+                .font(.system(size: 17, weight: .bold))
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
 
-    private var topBar: some View {
-        HStack(spacing: 18) {
-            Button { switchTab(0) } label: {
-                Text("推荐").fontWeight(tab == 0 ? .bold : .regular)
-                    .foregroundColor(tab == 0 ? .white : .white.opacity(0.45))
-            }
-            Button { switchTab(1) } label: {
-                Text("热门").fontWeight(tab == 1 ? .bold : .regular)
-                    .foregroundColor(tab == 1 ? .white : .white.opacity(0.45))
-            }
             Spacer()
+
             Button { showSearch = true } label: {
                 Image(systemName: "magnifyingglass")
+                    .font(.system(size: 19, weight: .semibold))
                     .foregroundColor(.white)
-                    .font(.system(size: 18, weight: .semibold))
+                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
             }
+
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape.fill")
+                    .font(.system(size: 19, weight: .semibold))
                     .foregroundColor(.white)
-                    .font(.system(size: 18, weight: .semibold))
+                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(LinearGradient(colors: [.black.opacity(0.55), .clear],
-                                   startPoint: .top, endPoint: .bottom))
+        .padding(.top, (UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0) + 4)
+        .padding(.bottom, 8)
     }
 
-    private var overlayBottom: some View {
+    private var bottomOverlay: some View {
         HStack(alignment: .bottom) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Button {
                     if let c = current, !c.authorId.isEmpty {
                         authorRef = AuthorRef(key: c.authorId, name: c.authorName)
                     }
                 } label: {
                     Text("@" + (current?.authorName ?? ""))
-                        .font(.headline)
+                        .font(.system(size: 16, weight: .semibold))
                         .foregroundColor(.white)
                 }
 
                 Text(current?.caption ?? "")
-                    .font(.footnote)
+                    .font(.system(size: 14))
                     .foregroundColor(.white)
                     .lineLimit(3)
-                    .padding(.trailing, 60)
+                    .padding(.trailing, 70)
             }
             .padding(.leading, 16)
-            .padding(.bottom, 34)
+            .padding(.bottom, 30)
 
             Spacer(minLength: 0)
 
-            VStack(spacing: 16) {
+            VStack(spacing: 18) {
                 Button {
                     if let c = current, !c.authorId.isEmpty {
                         authorRef = AuthorRef(key: c.authorId, name: c.authorName)
                     }
                 } label: {
                     ZStack {
-                        Circle().fill(Color.white.opacity(0.18)).frame(width: 46, height: 46)
+                        Circle().fill(Color.white.opacity(0.2)).frame(width: 46, height: 46)
+                        Circle().stroke(Color.white, lineWidth: 1.5).frame(width: 46, height: 46)
                         Text(String((current?.authorName ?? "?").prefix(1)))
-                            .foregroundColor(.white).font(.headline)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(.white)
                     }
                 }
 
-                VStack(spacing: 3) {
-                    Image(systemName: "heart.fill")
-                        .font(.system(size: 26, weight: .semibold))
-                        .foregroundColor(Color(red: 0.996, green: 0.173, blue: 0.333))
-                    Text(NumberShort.text(current?.likeCount ?? 0))
-                        .font(.caption2).bold().foregroundColor(.white)
-                }
+                actionItem("heart.fill",
+                           NumberShort.text(current?.likeCount ?? 0),
+                           Color(red: 0.996, green: 0.173, blue: 0.333))
 
-                VStack(spacing: 3) {
-                    Image(systemName: "bubble.right.fill")
-                        .font(.system(size: 24, weight: .semibold)).foregroundColor(.white)
-                    Text("评论").font(.caption2).foregroundColor(.white.opacity(0.7))
-                }
-
-                VStack(spacing: 3) {
-                    Image(systemName: "arrowshape.turn.up.right.fill")
-                        .font(.system(size: 24, weight: .semibold)).foregroundColor(.white)
-                    Text("分享").font(.caption2).foregroundColor(.white.opacity(0.7))
-                }
+                actionItem("bubble.right.fill", "评论", .white)
+                actionItem("arrowshape.turn.up.right.fill", "分享", .white)
             }
             .padding(.trailing, 12)
-            .padding(.bottom, 44)
+            .padding(.bottom, 40)
+        }
+    }
+
+    private func actionItem(_ symbol: String, _ text: String, _ tint: Color) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundColor(tint)
+                .shadow(color: .black.opacity(0.3), radius: 3, y: 1)
+            Text(text)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white)
         }
     }
 
@@ -614,78 +475,84 @@ struct Home: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-    private func switchTab(_ t: Int) {
-        guard tab != t else { return }
-        tab = t
-        store.reset(sort: t == 0 ? "newest" : "digg")
-        index = 0
-        load()
-    }
 }
 
-// MARK: - 竖向分页（UIScrollView）
+// MARK: - 竖向分页
 
-struct PlayerScrollView: UIViewRepresentable {
+struct VerticalFeed: UIViewRepresentable {
     let items: [FeedItem]
     @Binding var index: Int
     let playing: Bool
     let onTap: () -> Void
     let onFinished: () -> Void
 
-    @EnvironmentObject var scroller: ScrollController
-
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     func makeUIView(context: Context) -> UIScrollView {
-        let view = UIScrollView()
-        let host = UIHostingController(rootView: PagesHost(items: items,
+        let scroll = UIScrollView()
+        scroll.isPagingEnabled = true
+        scroll.showsVerticalScrollIndicator = false
+        scroll.contentInsetAdjustmentBehavior = .never
+        scroll.backgroundColor = .black
+        scroll.delegate = context.coordinator
+
+        let host = UIHostingController(rootView: PagesView(items: items,
                                                            index: $index,
+                                                           pageHeight: pageHeight(),
                                                            playing: playing,
                                                            onTap: onTap,
                                                            onFinished: onFinished))
         host.view.backgroundColor = .clear
-        host.view.frame = CGRect(x: 0, y: 0,
-                                 width: UIScreen.main.bounds.width,
-                                 height: UIScreen.main.bounds.height * CGFloat(max(items.count, 1)))
-        view.addSubview(host.view)
-        view.contentSize = host.view.frame.size
-        view.isPagingEnabled = true
-        view.showsVerticalScrollIndicator = false
-        view.contentInsetAdjustmentBehavior = .never
-        view.backgroundColor = .black
-        view.delegate = context.coordinator
+        scroll.addSubview(host.view)
         context.coordinator.host = host
-        scroller.scrollView = view
-        return view
+        context.coordinator.relayout(scroll, animated: false)
+        return scroll
     }
 
     func updateUIView(_ uiView: UIScrollView, context: Context) {
         context.coordinator.parent = self
-        scroller.scrollView = uiView
         if let host = context.coordinator.host {
-            host.rootView = PagesHost(items: items, index: $index,
-                                       playing: playing, onTap: onTap, onFinished: onFinished)
-            let height = UIScreen.main.bounds.height * CGFloat(max(items.count, 1))
-            host.view.frame = CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: height)
+            host.rootView = PagesView(items: items, index: $index,
+                                      pageHeight: uiView.bounds.height > 1 ? uiView.bounds.height : pageHeight(),
+                                      playing: playing, onTap: onTap, onFinished: onFinished)
         }
-        uiView.contentSize = CGSize(width: UIScreen.main.bounds.width,
-                                    height: UIScreen.main.bounds.height * CGFloat(max(items.count, 1)))
+        context.coordinator.relayout(uiView, animated: true)
+    }
+
+    /// 一页的高度：优先用 scrollView 真实高度，取不到时退回屏幕高度
+    private func pageHeight() -> CGFloat {
+        UIScreen.main.bounds.height
     }
 
     final class Coordinator: NSObject, UIScrollViewDelegate {
-        var parent: PlayerScrollView
-        var host: UIHostingController<PagesHost>?
-        private var lastIndex = 0
+        var parent: VerticalFeed
+        var host: UIHostingController<PagesView>?
+        var lastIndex = 0
 
-        init(_ parent: PlayerScrollView) {
+        init(_ parent: VerticalFeed) {
             self.parent = parent
             super.init()
         }
 
+        /// 关键：一页高度 == scrollView 可视高度，否则越滑越偏
+        func relayout(_ scroll: UIScrollView, animated: Bool) {
+            let h = scroll.bounds.height > 1 ? scroll.bounds.height : UIScreen.main.bounds.height
+            let w = scroll.bounds.width > 1 ? scroll.bounds.width : UIScreen.main.bounds.width
+            let total = h * CGFloat(max(parent.items.count, 1))
+            host?.view.frame = CGRect(x: 0, y: 0, width: w, height: total)
+            scroll.contentSize = CGSize(width: w, height: total)
+
+            // 外部（自动连播）改了 index → 同步滚动位置
+            if lastIndex != parent.index {
+                lastIndex = parent.index
+                scroll.setContentOffset(CGPoint(x: 0, y: CGFloat(parent.index) * h), animated: animated)
+            }
+        }
+
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
-            guard scrollView.bounds.height > 0 else { return }
-            let i = Int(round(scrollView.contentOffset.y / scrollView.bounds.height))
+            let h = scrollView.bounds.height
+            guard h > 1 else { return }
+            let i = Int(round(scrollView.contentOffset.y / h))
             if i != lastIndex, i >= 0, i < parent.items.count {
                 lastIndex = i
                 DispatchQueue.main.async { self.parent.index = i }
@@ -694,9 +561,10 @@ struct PlayerScrollView: UIViewRepresentable {
     }
 }
 
-struct PagesHost: View {
+struct PagesView: View {
     let items: [FeedItem]
     @Binding var index: Int
+    let pageHeight: CGFloat
     let playing: Bool
     let onTap: () -> Void
     let onFinished: () -> Void
@@ -706,12 +574,16 @@ struct PagesHost: View {
             ForEach(Array(items.enumerated()), id: \.element.id) { i, item in
                 VideoPage(item: item,
                           isActive: i == index,
+                          shouldLoad: abs(i - index) <= 1,
                           playing: playing,
                           onTap: onTap,
                           onFinished: onFinished)
-                    .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
+                    .frame(width: UIScreen.main.bounds.width, height: pageHeight)
             }
         }
+        .frame(width: UIScreen.main.bounds.width,
+               height: pageHeight * CGFloat(max(items.count, 1)),
+               alignment: .top)
     }
 }
 
@@ -720,103 +592,87 @@ struct PagesHost: View {
 struct VideoPage: View {
     let item: FeedItem
     let isActive: Bool
+    let shouldLoad: Bool
     let playing: Bool
     let onTap: () -> Void
     let onFinished: () -> Void
 
-    @State private var poster: UIImage?
-    @State private var ready = false
+    @State private var player: AVPlayer?
 
     var body: some View {
         ZStack {
-            // 底图：首帧，一直在，翻页时不会黑
-            Color.black
-            if let poster = poster {
-                Image(uiImage: poster)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .clipped()
-            }
+            // 首帧永远铺底：视频没出来时看到的是画面，不是黑的
+            RemoteImage(item: item)
 
-            PlayerSurface(player: PlayerPool.shared.player(for: item), ready: $ready)
-                .opacity(ready && isActive ? 1 : 0)
+            if let player = player {
+                PlayerSurface(player: player)
+            }
 
             if !playing && isActive {
                 Image(systemName: "play.fill")
-                    .font(.system(size: 58))
-                    .foregroundColor(.white.opacity(0.75))
+                    .font(.system(size: 62))
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 6)
             }
         }
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
-        .onAppear {
-            if poster == nil {
-                ImageLoader.shared.loadPoster(for: item) { img in
-                    if let img = img { poster = img }
-                }
-            }
-            applyPlayback()
-        }
-        .onChange(of: isActive) { active in
-            applyPlayback()
-        }
-        .onChange(of: playing) { _ in
-            applyPlayback()
-        }
+        .onAppear { sync(force: true) }
+        .onDisappear { teardown() }
+        .onChange(of: shouldLoad) { _ in sync(force: false) }
+        .onChange(of: isActive) { _ in sync(force: false) }
+        .onChange(of: playing) { _ in sync(force: false) }
         .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
-            guard isActive else { return }
-            let player = PlayerPool.shared.player(for: item)
-            guard let finished = note.object as? AVPlayerItem, finished === player.currentItem else { return }
+            guard isActive, let p = player, let finished = note.object as? AVPlayerItem,
+                  finished === p.currentItem else { return }
             if AppSettings.endBehavior == .loop {
-                player.seek(to: .zero)
-                player.play()
+                p.seek(to: .zero)
+                p.play()
             } else {
                 onFinished()
             }
         }
     }
 
-    private func applyPlayback() {
-        let player = PlayerPool.shared.player(for: item)
-        if isActive && playing {
-            player.play()
-        } else {
-            player.pause()
-            if isActive && AppSettings.endBehavior == .loop {
-                player.seek(to: .zero)
+    private func sync(force: Bool) {
+        if shouldLoad {
+            if player == nil {
+                let p = AVPlayer(url: item.streamURL)
+                p.actionAtItemEnd = .none
+                p.automaticallyWaitsToMinimizeStalling = false
+                p.isMuted = false
+                player = p
             }
+            if isActive && playing {
+                player?.play()
+            } else {
+                player?.pause()
+            }
+        } else {
+            // 离得远的页释放播放器，只留首帧图，控制内存
+            player?.pause()
+            player = nil
         }
+    }
+
+    private func teardown() {
+        player?.pause()
+        player = nil
     }
 }
 
 struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
-    @Binding var ready: Bool
 
     func makeUIView(context: Context) -> SurfaceView {
         let v = SurfaceView()
         v.playerLayer.player = player
-        context.coordinator.observe(player, ready: $ready)
         return v
     }
 
     func updateUIView(_ uiView: SurfaceView, context: Context) {
         if uiView.playerLayer.player !== player {
             uiView.playerLayer.player = player
-            context.coordinator.observe(player, ready: $ready)
-        }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator {
-        private var observation: NSKeyValueObservation?
-        func observe(_ player: AVPlayer, ready: Binding<Bool>) {
-            observation = player.observe(\.timeControlStatus, options: [.new]) { p, _ in
-                if p.timeControlStatus == .playing {
-                    DispatchQueue.main.async { ready.wrappedValue = true }
-                }
-            }
         }
     }
 }
@@ -901,79 +757,108 @@ struct SettingsSheet: View {
     }
 }
 
-// MARK: - 搜索
+// MARK: - 搜索页（仿抖音：顶部搜索条 + 三列网格）
 
-struct SearchSheet: View {
-    var onPick: (FeedItem) -> Void
-    @StateObject private var store = SearchStore()
+struct SearchPage: View {
+    @StateObject private var store = ListStore()
     @State private var text = ""
+    @State private var picked: FeedItem?
     @Environment(\.presentationMode) var presentation
 
+    private let columns = [GridItem(.flexible(), spacing: 2),
+                           GridItem(.flexible(), spacing: 2),
+                           GridItem(.flexible(), spacing: 2)]
+
     var body: some View {
-        NavigationView {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
             VStack(spacing: 0) {
-                HStack {
-                    TextField("搜作者 / 文案 / 合集", text: $text, onCommit: {
-                        store.search(text)
-                    })
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
+                HStack(spacing: 10) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundColor(.white.opacity(0.6))
+                        TextField("搜作者 / 文案 / 合集", text: $text, onCommit: {
+                            store.search(text)
+                        })
+                        .foregroundColor(.white)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                        if !text.isEmpty {
+                            Button { text = ""; store.search("") } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.white.opacity(0.4))
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 36)
+                    .background(Color.white.opacity(0.14))
+                    .clipShape(Capsule())
+
                     Button("搜索") { store.search(text) }
+                        .foregroundColor(.white)
+
+                    Button("取消") { presentation.wrappedValue.dismiss() }
+                        .foregroundColor(.white.opacity(0.8))
                 }
-                .padding()
+                .padding(.horizontal, 12)
+                .padding(.top, (UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0) + 6)
+                .padding(.bottom, 8)
 
                 if store.loading {
-                    ProgressView().padding()
+                    ProgressView().progressViewStyle(CircularProgressViewStyle(tint: .white)).padding()
                 }
                 if let msg = store.message {
-                    Text(msg).font(.footnote).foregroundColor(.gray).padding(.top, 8)
+                    Text(msg).font(.footnote).foregroundColor(.white.opacity(0.5)).padding(.top, 20)
                 }
 
-                List(store.results) { item in
-                    Button {
-                        onPick(item)
-                    } label: {
-                        HStack(spacing: 10) {
-                            RemoteThumb(item: item)
-                                .frame(width: 54, height: 72)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(item.caption.isEmpty ? "(无文案)" : item.caption)
-                                    .font(.subheadline).lineLimit(2)
-                                Text("@" + item.authorName + "  ❤ " + NumberShort.text(item.likeCount))
-                                    .font(.caption).foregroundColor(.secondary)
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 2) {
+                        ForEach(store.items) { item in
+                            Button { picked = item } label: {
+                                VideoGridCell(item: item)
                             }
                         }
                     }
                 }
-                .listStyle(.plain)
             }
-            .navigationBarTitle("搜索", displayMode: .inline)
-            .navigationBarItems(trailing: Button("关闭") { presentation.wrappedValue.dismiss() })
+        }
+        .statusBar(hidden: false)
+        .sheet(item: $picked) { item in
+            FullPlayerPage(item: item)
         }
     }
 }
 
-struct RemoteThumb: View {
+struct VideoGridCell: View {
     let item: FeedItem
-    @State private var image: UIImage?
+
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.1)
-            if let image = image {
-                Image(uiImage: image).resizable().aspectRatio(contentMode: .fill).clipped()
+        GeometryReader { geo in
+            ZStack(alignment: .bottomLeading) {
+                RemoteImage(item: item)
+                    .frame(width: geo.size.width, height: geo.size.width * 16 / 9)
+                    .clipped()
+
+                LinearGradient(colors: [.clear, .black.opacity(0.55)],
+                               startPoint: .center, endPoint: .bottom)
+                    .frame(height: 46)
+
+                HStack(spacing: 3) {
+                    Image(systemName: "heart.fill").font(.system(size: 10))
+                    Text(NumberShort.text(item.likeCount)).font(.system(size: 11, weight: .semibold))
+                }
+                .foregroundColor(.white)
+                .padding(6)
             }
         }
-        .onAppear {
-            ImageLoader.shared.loadPoster(for: item) { img in
-                if let img = img { image = img }
-            }
-        }
+        .aspectRatio(9.0 / 16.0, contentMode: .fit)
+        .clipped()
     }
 }
 
-// MARK: - 作者主页
+// MARK: - 作者主页（仿抖音：头像/统计 + 作品网格）
 
 struct AuthorRef: Identifiable {
     let key: String
@@ -981,91 +866,159 @@ struct AuthorRef: Identifiable {
     var id: String { key }
 }
 
-struct AuthorSheet: View {
+struct AuthorPage: View {
     let key: String
     let fallbackName: String
-    @StateObject private var store = AuthorStore()
-    @State private var playingItem: FeedItem?
+
+    @StateObject private var info = AuthorInfoStore()
+    @StateObject private var list = ListStore()
+    @State private var picked: FeedItem?
     @Environment(\.presentationMode) var presentation
 
+    private let columns = [GridItem(.flexible(), spacing: 2),
+                           GridItem(.flexible(), spacing: 2),
+                           GridItem(.flexible(), spacing: 2)]
+
     var body: some View {
-        NavigationView {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
             VStack(spacing: 0) {
-                VStack(spacing: 8) {
+                HStack {
+                    Button { presentation.wrappedValue.dismiss() } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                    Spacer()
+                    Text("@" + (info.info?.name ?? fallbackName))
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.white)
+                    Spacer()
+                    Color.clear.frame(width: 20, height: 20)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, (UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0) + 6)
+                .padding(.bottom, 12)
+
+                VStack(spacing: 10) {
                     ZStack {
-                        Circle().fill(Color.gray.opacity(0.25)).frame(width: 64, height: 64)
-                        Text(String((store.info?.name ?? fallbackName).prefix(1)))
-                            .font(.title).bold()
+                        Circle().fill(Color.white.opacity(0.15)).frame(width: 76, height: 76)
+                        Circle().stroke(Color.white, lineWidth: 2).frame(width: 76, height: 76)
+                        Text(String((info.info?.name ?? fallbackName).prefix(1)))
+                            .font(.system(size: 32, weight: .semibold))
+                            .foregroundColor(.white)
                     }
-                    Text("@" + (store.info?.name ?? fallbackName)).font(.headline)
-                    HStack(spacing: 26) {
-                        stat("作品", "\(store.info?.works ?? 0)")
-                        stat("获赞", NumberShort.text(store.info?.likes ?? 0))
+
+                    Text("@" + (info.info?.name ?? fallbackName))
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundColor(.white)
+
+                    HStack(spacing: 34) {
+                        stat("\(info.info?.works ?? 0)", "作品")
+                        stat(NumberShort.text(info.info?.likes ?? 0), "获赞")
+                        stat("--", "关注")
+                        stat("--", "粉丝")
                     }
                 }
-                .padding(.vertical, 20)
+                .padding(.bottom, 16)
 
-                if let msg = store.message {
-                    Text(msg).font(.footnote).foregroundColor(.gray)
+                if list.loading {
+                    ProgressView().progressViewStyle(CircularProgressViewStyle(tint: .white)).padding()
                 }
 
-                List(store.items) { item in
-                    Button { playingItem = item } label: {
-                        HStack(spacing: 10) {
-                            RemoteThumb(item: item)
-                                .frame(width: 54, height: 72)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(item.caption.isEmpty ? "(无文案)" : item.caption)
-                                    .font(.subheadline).lineLimit(2)
-                                Text("❤ " + NumberShort.text(item.likeCount))
-                                    .font(.caption).foregroundColor(.secondary)
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 2) {
+                        ForEach(list.items) { item in
+                            Button { picked = item } label: {
+                                VideoGridCell(item: item)
                             }
                         }
                     }
                 }
-                .listStyle(.plain)
             }
-            .navigationBarTitle("作者主页", displayMode: .inline)
-            .navigationBarItems(trailing: Button("关闭") { presentation.wrappedValue.dismiss() })
         }
-        .onAppear { store.load(key: key) }
-        .sheet(item: $playingItem) { item in
-            FullPlayerSheet(item: item)
+        .statusBar(hidden: false)
+        .sheet(item: $picked) { item in
+            FullPlayerPage(item: item)
+        }
+        .onAppear {
+            info.load(key: key)
+            list.author(key)
         }
     }
 
-    private func stat(_ title: String, _ value: String) -> some View {
+    private func stat(_ value: String, _ title: String) -> some View {
         VStack(spacing: 2) {
-            Text(value).font(.headline)
-            Text(title).font(.caption).foregroundColor(.secondary)
+            Text(value).font(.system(size: 17, weight: .bold)).foregroundColor(.white)
+            Text(title).font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
         }
     }
 }
 
-// MARK: - 全屏播放（搜索结果 / 作者作品）
+// MARK: - 全屏播放
 
-struct FullPlayerSheet: View {
+struct FullPlayerPage: View {
     let item: FeedItem
     @State private var player: AVPlayer?
+    @State private var playing = true
     @Environment(\.presentationMode) var presentation
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            Color.black.edgesIgnoringSafeArea(.all)
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            RemoteImage(item: item)
             if let player = player {
-                PlayerSurface(player: player, ready: .constant(true))
-                    .edgesIgnoringSafeArea(.all)
+                PlayerSurface(player: player)
             }
-            Button { presentation.wrappedValue.dismiss() } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 30))
-                    .foregroundColor(.white.opacity(0.85))
-                    .padding()
+
+            if !playing {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 62))
+                    .foregroundColor(.white.opacity(0.75))
             }
+
+            VStack {
+                HStack {
+                    Button { presentation.wrappedValue.dismiss() } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(.white)
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, (UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0) + 6)
+                Spacer()
+                HStack(alignment: .bottom) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("@" + item.authorName)
+                            .font(.system(size: 16, weight: .semibold)).foregroundColor(.white)
+                        Text(item.caption)
+                            .font(.system(size: 14)).foregroundColor(.white).lineLimit(3)
+                    }
+                    Spacer()
+                    VStack(spacing: 4) {
+                        Image(systemName: "heart.fill")
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundColor(Color(red: 0.996, green: 0.173, blue: 0.333))
+                        Text(NumberShort.text(item.likeCount))
+                            .font(.system(size: 11, weight: .semibold)).foregroundColor(.white)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 40)
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            playing.toggle()
+            if playing { player?.play() } else { player?.pause() }
         }
         .onAppear {
             let p = AVPlayer(url: item.streamURL)
+            p.automaticallyWaitsToMinimizeStalling = false
             p.play()
             player = p
         }
