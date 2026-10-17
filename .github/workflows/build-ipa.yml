@@ -1,0 +1,55 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境
+        run: xcodebuild -version
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Tiktok.xcodeproj \
+            -target Tiktok \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/build/Release-iphoneos" \
+            OBJROOT="$PWD/build/obj" SYMROOT="$PWD/build/sym" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+          APP=$(find build/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          [ -z "$APP" ] && { echo "::error::没有 .app"; tail -60 build.log; exit 1; }
+          EXE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          [ -f "$APP/$EXE" ] || { echo "::error::app 里没有可执行文件"; tail -60 build.log; exit 1; }
+          echo "APP=$APP"
+
+      - name: 失败保日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: 打 ipa
+        run: |
+          APP=$(find build/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          mkdir -p out/Payload && cp -R "$APP" out/Payload/
+          cd out && zip -qry TiktokAVPlayer-unsigned.ipa Payload && ls -lh TiktokAVPlayer-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TiktokAVPlayer-unsigned-ipa
+          path: out/TiktokAVPlayer-unsigned.ipa
